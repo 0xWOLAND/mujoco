@@ -419,7 +419,7 @@ def _ray_hfield_wrapper(
     dists, ids = [], []
     for i, id_ in enumerate(geom_id):
         dist = ray_hfield(m, d, id_, pnt[i], vec[i])
-        dist = jp.reshape(dist, (1,))  # Match expected shape
+        dist = jp.reshape(dist, (1,)) 
         dists.append(dist)
         ids.append(jp.array([id_]))
     dists = jp.concatenate(dists)
