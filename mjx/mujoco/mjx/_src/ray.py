@@ -18,6 +18,7 @@ from typing import Sequence, Tuple
 
 import jax
 from jax import numpy as jp
+from jax import lax
 import mujoco
 from mujoco.mjx._src import math
 # pylint: disable=g-importing-member
@@ -26,6 +27,7 @@ from mujoco.mjx._src.types import GeomType
 from mujoco.mjx._src.types import Model
 # pylint: enable=g-importing-member
 import numpy as np
+from typing import Any
 
 
 def _ray_quad(
@@ -227,6 +229,7 @@ _RAY_FUNC = {
     GeomType.ELLIPSOID: _ray_ellipsoid,
     GeomType.BOX: _ray_box,
     GeomType.MESH: _ray_mesh,
+    GeomType.HFIELD: lambda m, d, *args: _ray_hfield_wrapper(m, d, *args), 
 }
 
 
@@ -278,6 +281,8 @@ def ray(
 
     if geom_type == GeomType.MESH:
       dist, id_ = fn(m, id_, *args)
+    elif geom_type == GeomType.HFIELD:
+      dist, id_ = fn(m, d, id_, *args)
     else:
       dist = jax.vmap(fn)(*args)
 
@@ -285,7 +290,7 @@ def ray(
     dists, ids = dists + [dist], ids + [id_]
 
   if not ids:
-    return jp.array(-1), jp.array(-1.0)
+    return jp.array(-1.0.), jp.array(-1.0)
 
   dists = jp.concatenate(dists)
   ids = jp.concatenate(ids)
@@ -310,4 +315,113 @@ def ray_geom(
   Returns:
     dist: distance from ray origin to geom surface
   """
+  if geomtype == GeomType.HFIELD:
+    raise ValueError("ray_geom does not support hfield")    
   return _RAY_FUNC[geomtype](size, pnt, vec)
+
+def ray_hfield(m: Model, d: Data, geomid: int, pnt: jp.ndarray, vec: jp.ndarray) -> jp.ndarray:
+    # Constants and early out
+    eps = 1e-10
+    default_return_val = jp.array(-1.0, dtype=vec.dtype)
+
+    # Retrieve heightfield metadata
+    hfid = m.geom_dataid[geomid]
+    size = m.hfield_size[hfid]   # [x, y, z, unused]
+    nrow = m.hfield_nrow[hfid]
+    ncol = m.hfield_ncol[hfid]
+    hf_data = m.hfield_data[hfid]  # [nrow * ncol]
+
+    # Geom transform: world → local
+    pos = d.geom_xpos[geomid]
+    mat = d.geom_xmat[geomid].reshape(3, 3)
+    pnt_local = mat.T @ (pnt - pos)
+    vec_local = mat.T @ vec
+
+    vec_norm = jp.linalg.norm(vec_local)
+    vec_local = vec_local / (vec_norm + eps)
+
+    # Define bounding box in heightfield local frame
+    x0, y0 = -size[0], -size[1]
+    x1, y1 = size[0], size[1]
+
+    # Calculate entry/exit t-range using slab method
+    inv = 1.0 / (vec_local + eps)
+    tx0 = (x0 - pnt_local[0]) * inv[0]
+    tx1 = (x1 - pnt_local[0]) * inv[0]
+    ty0 = (y0 - pnt_local[1]) * inv[1]
+    ty1 = (y1 - pnt_local[1]) * inv[1]
+
+    tmin = jp.maximum(jp.minimum(tx0, tx1), jp.minimum(ty0, ty1))
+    tmax = jp.minimum(jp.maximum(tx0, tx1), jp.maximum(ty0, ty1))
+
+    def out_of_bounds(_: Any) -> jp.ndarray:
+        return default_return_val
+
+    def intersect_bbox(_: Any) -> jp.ndarray:
+        hf_scale = jp.array([
+            2 * size[0] / ncol,  # dx
+            2 * size[1] / nrow,  # dy
+            size[2],             # height scale
+        ], dtype=vec.dtype)
+
+        def step_fn(state):
+            t, _ = state
+            p = pnt_local + t * vec_local
+            col = jp.clip((p[0] - x0) / (2 * size[0]) * ncol, 0, ncol - 2)
+            row = jp.clip((p[1] - y0) / (2 * size[1]) * nrow, 0, nrow - 2)
+            col_i = jp.floor(col).astype(jp.int32)
+            row_i = jp.floor(row).astype(jp.int32)
+            col_f = col - col_i
+            row_f = row - row_i
+
+            # Bilinear interpolation
+            idx = lambda r, c: r * ncol + c
+            h00 = hf_data[idx(row_i, col_i)] * hf_scale[2]
+            h01 = hf_data[idx(row_i, col_i + 1)] * hf_scale[2]
+            h10 = hf_data[idx(row_i + 1, col_i)] * hf_scale[2]
+            h11 = hf_data[idx(row_i + 1, col_i + 1)] * hf_scale[2]
+
+            h = (
+                h00 * (1 - col_f) * (1 - row_f) +
+                h01 * col_f * (1 - row_f) +
+                h10 * (1 - col_f) * row_f +
+                h11 * col_f * row_f
+            )
+
+            hit = (p[2] <= h) & (vec_local[2] < 0)
+            return (t + step_size, jp.where(hit, t * vec_norm, -1.0))
+
+        def cond_fn(state):
+            t, final = state
+            return (t <= tmax) & (final < 0)
+
+        step_size = jp.minimum(hf_scale[0], hf_scale[1]) * 0.5 / (jp.abs(vec_local[2]) + eps)
+        init = (jp.maximum(tmin, 0.0), default_return_val)
+        final_t = lax.while_loop(cond_fn, step_fn, init)[1]
+        return final_t
+
+    return lax.cond(
+        (tmin > tmax) | (tmax < 0.0),
+        out_of_bounds,
+        intersect_bbox,
+        operand=None
+    )
+
+def _ray_hfield_wrapper(
+    m: Model,
+    d: Data,
+    geom_id: np.ndarray,
+    unused_size: jp.ndarray,
+    pnt: jp.ndarray,
+    vec: jp.ndarray,
+) -> Tuple[jp.ndarray, jp.ndarray]:
+    """Wrapper for ray_hfield to match the expected interface for _RAY_FUNC."""
+    dists, ids = [], []
+    for i, id_ in enumerate(geom_id):
+        dist = ray_hfield(m, d, id_, pnt[i], vec[i])
+        dist = jp.reshape(dist, (1,)) 
+        dists.append(dist)
+        ids.append(jp.array([id_]))
+    dists = jp.concatenate(dists)
+    ids = jp.concatenate(ids)
+    return dists, ids
